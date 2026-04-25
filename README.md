@@ -114,6 +114,6 @@ Useful for diagnosing why OCR might be underperforming on a specific image.
 | Module | File | Status |
 |--------|------|--------|
 | 1. Preprocess | `modules/preprocess.py` | ✅ Complete |
-| 2. OCR Engine | `modules/ocr_engine.py` | 🔜 Next |
-| 3. Sensitive Detector | `modules/sensitive_detector.py` | 🔜 Upcoming |
+| 2. OCR Engine | `modules/ocr_engine.py` | ✅ Complete |
+| 3. Sensitive Detector | `modules/sensitive_detector.py` | ✅ Complete |
 | Entry Point | `main.py` | 🔜 Final step |
