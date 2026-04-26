@@ -518,7 +518,8 @@ def _build_record(
         "label"            : "pending",             # overwritten by auto-labeler
         "label_source"     : "pending",
         "labeled_at"       : timestamp,
-        "phase"            : "phase_2_nlp" if match.get("source") == "nlp"
+        "phase"            : "phase_3_vision" if match.get("source") == "vision"
+                             else "phase_2_nlp" if match.get("source") == "nlp"
                              else "phase_1_regex",
         "source"           : match.get("source", "regex"),
         "notes"            : "",
@@ -548,6 +549,10 @@ def _auto_label(match: dict, ocr_text: str) -> tuple:
 
     # Rule 1: NLP entity types → auto sensitive
     if ptype in AUTO_LABEL_SENSITIVE["nlp_types"]:
+        return "sensitive", "auto_high_conf"
+
+    # Rule 1b: Vision document classifications indicate image-level sensitivity.
+    if source == "vision" and ptype == "document_type" and conf in ("high", "medium"):
         return "sensitive", "auto_high_conf"
 
     # Rule 2: High-confidence regex types → auto sensitive

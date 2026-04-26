@@ -116,7 +116,7 @@ def generate_report(
         "total_findings" : detection_result["total"],
         "findings"       : _build_findings(detection_result["matches"]),
         "finding_types"  : _summarise_types(detection_result["matches"]),
-        "phase"          : "phase_1_regex",        # updated in Phase 2/3
+        "phase"          : _detect_phase(detection_result["matches"]),
         "notes"          : _build_notes(detection_result),
     }
 
@@ -220,6 +220,16 @@ def _summarise_types(matches: list) -> dict:
     for m in matches:
         summary[m["type"]] = summary.get(m["type"], 0) + 1
     return summary
+
+
+def _detect_phase(matches: list) -> str:
+    """Return highest pipeline phase represented in the finding sources."""
+    sources = {m.get("source", "regex") for m in matches}
+    if "vision" in sources:
+        return "phase_3_vision"
+    if "nlp" in sources:
+        return "phase_2_nlp"
+    return "phase_1_regex"
 
 
 def _build_notes(detection_result: dict) -> list:
