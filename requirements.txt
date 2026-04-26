@@ -1,9 +1,21 @@
 # requirements.txt
 # Install with: pip install -r requirements.txt
-# Also install Tesseract system binary — see README.md
 
+# ── Phase 1 ───────────────────────────────────────────────
 opencv-python>=4.8.0
 pytesseract>=0.3.10
 Pillow>=10.0.0
 pandas>=2.0.0
 numpy>=1.24.0
+cryptography>=41.0.0
+
+# ── Phase 2 — NLP ─────────────────────────────────────────
+# CPU-only torch install (lighter — no CUDA):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Standard install (auto-detects GPU if present):
+#   pip install torch
+torch>=2.0.0
+transformers>=4.30.0
+
+# Note: dslim/bert-base-NER model (~400MB) downloads automatically
+# on first run of nlp_classifier.py and is cached locally.
