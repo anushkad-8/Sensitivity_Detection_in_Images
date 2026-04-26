@@ -12,6 +12,14 @@ CHANGES (Anti-Obfuscation Update):
     2. preprocess_image() now also returns channel_images dict alongside binary + scale_factor.
        ocr_engine.py uses these to run OCR on each channel and merge results.
     3. scale_factor bug fix retained from previous version.
+
+CHANGES (v3 — Two-Pass OCR fix):
+    4. preprocess_image() now returns gray_raw — the grayscale image BEFORE OTSU
+       binarization and BEFORE denoising. This is used by ocr_engine.py as a
+       second-pass image when binarization destroys PEM header dashes and
+       base64 characters ('+', '/', '=') that OTSU treats as noise.
+       Return signature is now:
+           (binary, scale_factor, channel_images, gray_raw)
 """
 
 import cv2
@@ -32,12 +40,16 @@ def preprocess_image(image_path: str, save_debug: bool = False) -> tuple:
         save_debug  : If True, saves intermediate steps to output/debug/ folder.
 
     Returns:
-        (clean_image, scale_factor, channel_images) tuple:
-            clean_image    — preprocessed grayscale numpy array ready for Tesseract OCR.
-            scale_factor   — float (1.0 or 2.0). Divide OCR bounding box coords by this
-                             before drawing on original image.
+        (clean_image, scale_factor, channel_images, gray_raw) tuple:
+
+            clean_image    — OTSU-binarized grayscale numpy array for Tesseract.
+            scale_factor   — float (1.0 or 2.0). Divide OCR bounding box coords by
+                             this before drawing on original image.
             channel_images — dict {"R": arr, "G": arr, "B": arr} each preprocessed
-                             independently. Used by ocr_engine to catch channel-hidden text.
+                             independently. Used by ocr_engine for channel-hidden text.
+            gray_raw       — grayscale image AFTER resize but BEFORE binarization
+                             and denoising. Used by ocr_engine second-pass OCR for
+                             PEM keys and other content OTSU destroys.  [NEW v3]
 
     Raises:
         FileNotFoundError : If the image path does not exist.
@@ -48,7 +60,6 @@ def preprocess_image(image_path: str, save_debug: bool = False) -> tuple:
     image = _load_image(image_path)
 
     # ── Step 1: Extract colour channels BEFORE grayscale conversion ───────────
-    # Must happen on the original BGR image, not after grayscale.
     channel_images = _split_colour_channels(image, save_debug)
 
     # ── Step 2: Grayscale ─────────────────────────────────────────────────────
@@ -63,6 +74,12 @@ def preprocess_image(image_path: str, save_debug: bool = False) -> tuple:
     gray, scale_factor = _resize_if_small(gray)
     _debug_save(gray, "03_after_resize", save_debug)
 
+    # ── FIX v3: Save gray_raw HERE — after resize, before denoise/threshold ───
+    # OTSU and denoising both destroy thin characters (dashes, +, /, =) that
+    # appear in PEM headers and base64 key body lines.
+    # ocr_engine second-pass uses this cleaner image with a lower conf threshold.
+    gray_raw = gray.copy()
+
     # ── Step 5: Denoise ───────────────────────────────────────────────────────
     gray = _denoise(gray)
     _debug_save(gray, "04_after_denoise", save_debug)
@@ -73,7 +90,9 @@ def preprocess_image(image_path: str, save_debug: bool = False) -> tuple:
 
     print(f"[Preprocess] Scale factor applied: {scale_factor}x")
     print(f"[Preprocess] Colour channels prepared: {list(channel_images.keys())}")
-    return binary, scale_factor, channel_images
+
+    # FIX v3: Return gray_raw as 4th element
+    return binary, scale_factor, channel_images, gray_raw
 
 
 # ─────────────────────────────────────────────
@@ -93,18 +112,9 @@ def _split_colour_channels(image: np.ndarray, save_debug: bool = False) -> dict:
         channels. By running OCR on each channel separately, we catch text that only
         appears in one channel.
 
-    Example attack:
-        Normal viewer sees a blank white image.
-        Blue channel contains: "Aadhaar: 9183 0074 6619" in blue-on-white.
-        Grayscale OCR: sees nothing. Channel OCR: catches it.
-
     Returns:
-        {
-            "R": binary_array,
-            "G": binary_array,
-            "B": binary_array
-        }
-        Returns empty dict if image is already grayscale (no channels to split).
+        {"R": binary_array, "G": binary_array, "B": binary_array}
+        Returns empty dict if image is already grayscale.
     """
     if len(image.shape) == 2:
         print("[Preprocess] Grayscale image — colour channel splitting skipped.")
@@ -115,19 +125,14 @@ def _split_colour_channels(image: np.ndarray, save_debug: bool = False) -> dict:
     result = {}
 
     for name, ch in channels.items():
-        # Invert if dark background
         if np.mean(ch) < 127:
             ch = cv2.bitwise_not(ch)
 
-        # Upscale small channel images for better OCR
         h, w = ch.shape[:2]
         if min(h, w) < 1000:
             ch = cv2.resize(ch, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
 
-        # Denoise lightly
         ch = cv2.fastNlMeansDenoising(ch, h=10, templateWindowSize=7, searchWindowSize=21)
-
-        # Threshold
         _, binary = cv2.threshold(ch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
         result[name] = binary
@@ -175,11 +180,6 @@ def _auto_invert(gray: np.ndarray) -> np.ndarray:
 
 
 def _resize_if_small(gray: np.ndarray, min_dimension: int = 1000) -> tuple:
-    """
-    Upscale image if too small for Tesseract.
-    Returns (resized_image, scale_factor).
-    scale_factor is 2.0 if upscaled, else 1.0.
-    """
     h, w = gray.shape[:2]
     print(f"[Preprocess] Image size: {w}x{h}")
     if min(h, w) < min_dimension:
@@ -257,7 +257,9 @@ if __name__ == "__main__":
         sys.exit(1)
     img_path = sys.argv[1]
     print("\n── Running Preprocessing Pipeline ──")
-    result, sf, channels = preprocess_image(img_path, save_debug=True)
+    # FIX v3: Unpack 4 return values
+    result, sf, channels, gray_raw = preprocess_image(img_path, save_debug=True)
     print(f"\n── Done. Output shape: {result.shape} | scale_factor: {sf} ──")
     print(f"── Colour channels extracted: {list(channels.keys())} ──")
+    print(f"── Gray raw shape (for second-pass OCR): {gray_raw.shape} ──")
     print("Debug images saved to: output/debug/")

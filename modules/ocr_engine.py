@@ -6,29 +6,35 @@ using Tesseract OCR.
 
 Input  : Cleaned image (numpy array) from Module 1 — preprocess.py
          Channel images dict from preprocess.py (for obfuscation detection)
+         Gray raw image from preprocess.py (for second-pass OCR)
 Output : Dictionary with:
-            "text"             → raw extracted text string
-            "text_normalized"  → cleaned text (USE THIS for regex detection)
-            "digit_runs"       → all digit sequences extracted (for safer Aadhaar/PAN matching)
-            "words"            → pandas DataFrame with word positions (for highlighting)
-            "obfuscation"      → full result dict from anti_obfuscation.detect_all()
-            "obfuscation_flags"→ simplified bool flags for decision engine
+            "text"              → raw extracted text string
+            "text_normalized"   → cleaned text (USE THIS for regex detection)
+            "digit_runs"        → all digit sequences extracted
+            "words"             → pandas DataFrame with word positions
+            "obfuscation"       → full result dict from anti_obfuscation.detect_all()
+            "obfuscation_flags" → simplified bool flags for decision engine
 
-CHANGES (Anti-Obfuscation Update):
-    1. _filter_words() replaced by reassemble_fragments() — spatially adjacent
-       low-confidence digit tokens are rejoined before being discarded.
-    2. normalize_ocr_text() added — strips zero-width chars, maps homoglyphs
-       (Cyrillic/Greek → Latin), rejoins fragmented digit sequences.
-    3. extract_digit_runs() added — pulls all digit sequences for downstream regex.
-    4. _run_channel_ocr() added — runs OCR on each colour channel image from
-       preprocess.py and merges any unique tokens into the main text.
-    5. anti_obfuscation.detect_all() integrated — called after normalization.
-       Returns decoded_text (base64/hex decoded) for Module 3 to scan.
-    6. run_ocr() return dict extended — backward compatible (text + words unchanged).
+CHANGES v3 — Two-Pass OCR (Root Cause Fix):
+    ROOT CAUSE IDENTIFIED:
+        OTSU binarization destroys thin characters: dashes (-----), plus (+),
+        forward slash (/), equals (=). These are exactly the characters that make
+        up PEM headers and base64 key body lines. After OTSU, Tesseract finds
+        0 tokens for those lines — they never reach any filter or scanner.
 
-Windows Note:
-    Tesseract binary path is configured in _configure_tesseract().
-    Update TESSERACT_PATH if your installation is in a different location.
+    FIX:
+        run_ocr() now accepts gray_raw (grayscale before OTSU) from preprocess.py.
+        After first-pass OCR, _looks_like_partial_pem() checks if output shows
+        signs of a partial PEM block (base64 body found, but no header/footer).
+        If yes, a SECOND PASS runs on gray_raw with PSM 6 and confidence threshold
+        lowered to 30. The two passes are merged before normalization and scanning.
+
+    OTHER CHANGES:
+        - _extract_pem_header_rows() pre-pass retained (catches fragmented headers).
+        - Base64/hex token preservation retained (v2).
+        - Dash token preservation retained.
+        - DEFAULT_PSM remains 4.
+        - run_ocr() signature extended with gray_raw=None (backward compatible).
 """
 
 import os
@@ -53,38 +59,32 @@ TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 # CONFIG
 # ─────────────────────────────────────────────
 
-DEFAULT_PSM                = 6
+DEFAULT_PSM                  = 4    # Single column, variable sizes
 DEFAULT_CONFIDENCE_THRESHOLD = 60
+SECOND_PASS_PSM              = 6    # Uniform text block — better for PEM
+SECOND_PASS_CONF_THRESHOLD   = 30   # Lower — PEM dashes/slashes always low-conf
 
-# Homoglyph map: visually identical characters from other scripts → Latin equivalent
-# Attackers use these to fool regex matching: "Рrаkаsh" instead of "Prakash"
 HOMOGLYPH_MAP = {
-    # Cyrillic → Latin
     'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c',
     'у': 'y', 'х': 'x', 'В': 'B', 'Е': 'E', 'К': 'K',
     'М': 'M', 'Н': 'H', 'О': 'O', 'Р': 'P', 'С': 'C',
     'Т': 'T', 'У': 'Y', 'Х': 'X',
-    # Greek → Latin
     'Α': 'A', 'Β': 'B', 'Ε': 'E', 'Ζ': 'Z', 'Η': 'H',
     'Ι': 'I', 'Κ': 'K', 'Μ': 'M', 'Ν': 'N', 'Ο': 'O',
     'Ρ': 'P', 'Τ': 'T', 'Υ': 'Y', 'Χ': 'X',
-    # Fullwidth digits → ASCII digits
     '０': '0', '１': '1', '２': '2', '３': '3', '４': '4',
     '５': '5', '６': '6', '７': '7', '８': '8', '９': '9',
-    # Common visual substitutions Tesseract sometimes returns
     '|': 'I', 'ⅼ': 'l',
 }
 
-# Zero-width and invisible Unicode characters attackers insert to break pattern matching
 ZERO_WIDTH_CHARS = [
-    '\u200b',  # Zero width space
-    '\u200c',  # Zero width non-joiner
-    '\u200d',  # Zero width joiner
-    '\u200e',  # Left-to-right mark
-    '\u200f',  # Right-to-left mark
-    '\ufeff',  # Byte order mark / zero width no-break space
-    '\u00ad',  # Soft hyphen (invisible but breaks word boundaries)
+    '\u200b', '\u200c', '\u200d', '\u200e', '\u200f', '\ufeff', '\u00ad',
 ]
+
+_PEM_LINE_RE = re.compile(
+    r'-{3,}\s*(?:BEGIN|END)\s+[\w\s]+\s*-{3,}',
+    re.IGNORECASE
+)
 
 
 # ─────────────────────────────────────────────
@@ -93,56 +93,76 @@ ZERO_WIDTH_CHARS = [
 
 def run_ocr(
     clean_image           : np.ndarray,
-    channel_images        : dict = None,
-    psm                   : int  = DEFAULT_PSM,
-    confidence_threshold  : int  = DEFAULT_CONFIDENCE_THRESHOLD
+    channel_images        : dict  = None,
+    psm                   : int   = DEFAULT_PSM,
+    confidence_threshold  : int   = DEFAULT_CONFIDENCE_THRESHOLD,
+    gray_raw              : np.ndarray = None,   # FIX v3: pre-OTSU grayscale
 ) -> dict:
     """
     Full OCR pipeline on a preprocessed image.
 
     Args:
-        clean_image          : Numpy array output from preprocess_image() — Module 1.
-        channel_images       : Dict {"R": arr, "G": arr, "B": arr} from preprocess_image().
-                               Pass None if preprocess was run without channel splitting.
-        psm                  : Tesseract Page Segmentation Mode (default: 6).
-        confidence_threshold : Drop words below this confidence (default: 60).
+        clean_image          : OTSU-binarized numpy array from preprocess_image().
+        channel_images       : {"R": arr, "G": arr, "B": arr} from preprocess_image().
+        psm                  : Tesseract PSM for first pass (default: 4).
+        confidence_threshold : Confidence cutoff for first pass (default: 60).
+        gray_raw             : Pre-OTSU grayscale from preprocess_image() [NEW v3].
+                               Pass this to enable second-pass PEM recovery.
 
     Returns:
         {
-            "text"             : str        — raw joined text (unchanged from before)
-            "text_normalized"  : str        — USE THIS for regex detection in Module 3
-            "digit_runs"       : list[str]  — all digit sequences found
-            "words"            : DataFrame  — word table [word, left, top, width, height, conf]
-            "obfuscation"      : dict       — full anti_obfuscation result
-            "obfuscation_flags": dict       — simplified booleans for decision engine
+            "text"              : str
+            "text_normalized"   : str
+            "text_for_detection": str
+            "digit_runs"        : list[str]
+            "words"             : DataFrame
+            "obfuscation"       : dict
+            "obfuscation_flags" : dict
         }
-
-    Raises:
-        ValueError   : If clean_image is None or not a numpy array.
-        RuntimeError : If Tesseract binary is not found at TESSERACT_PATH.
     """
-
     _configure_tesseract()
     _validate_image(clean_image)
 
-    # ── Step 1: Run Tesseract on main preprocessed image ─────────────────────
-    raw_df   = _extract_word_data(clean_image, psm)
+    # ── Step 1: First-pass OCR on OTSU-binarized image ────────────────────────
+    raw_df      = _extract_word_data(clean_image, psm)
     filtered_df = reassemble_fragments(raw_df, confidence_threshold)
 
-    # ── Step 2: Run OCR on colour channels and merge unique tokens ────────────
+    # ── Step 2: Channel OCR ───────────────────────────────────────────────────
     if channel_images:
         filtered_df = _run_channel_ocr(channel_images, filtered_df, psm, confidence_threshold)
 
-    # ── Step 3: Build raw text string ─────────────────────────────────────────
+    # ── Step 3: Build raw text from first pass ────────────────────────────────
     raw_text = _build_text_string(filtered_df)
 
-    # ── Step 4: Normalize — homoglyphs, zero-width chars, digit rejoining ─────
+    # ── FIX v3: Second-pass OCR on raw grayscale if PEM detected partially ────
+    #
+    # WHY: OTSU binarization kills thin PEM characters (dashes, +, /, =).
+    # After first pass, if we see base64-like content but NO PEM header/footer,
+    # we re-run OCR on the raw grayscale (pre-OTSU) with:
+    #   - PSM 6 (uniform block — better for structured PEM text)
+    #   - Confidence threshold 30 (PEM dashes always get low Tesseract scores)
+    # Results are merged with first pass before normalization.
+    #
+    if gray_raw is not None and _looks_like_partial_pem(raw_text, filtered_df):
+        print("\n[OCR] ⚠️  Partial PEM detected — running second pass on raw grayscale.")
+        print(f"[OCR] Second pass: PSM={SECOND_PASS_PSM}, conf_threshold={SECOND_PASS_CONF_THRESHOLD}")
+
+        raw_df2      = _extract_word_data(gray_raw, SECOND_PASS_PSM)
+        filtered_df2 = reassemble_fragments(raw_df2, SECOND_PASS_CONF_THRESHOLD)
+        raw_text2    = _build_text_string(filtered_df2)
+
+        print(f"[OCR] Second pass extracted {len(filtered_df2)} tokens.")
+        print(f"[OCR] Second pass text: {raw_text2[:150]}")
+
+        # Merge: append second-pass words and rebuild combined text
+        filtered_df = pd.concat([filtered_df, filtered_df2], ignore_index=True)
+        raw_text    = _build_text_string(filtered_df)
+
+    # ── Step 4: Normalize ─────────────────────────────────────────────────────
     normalized_text = normalize_ocr_text(raw_text)
     digit_runs      = extract_digit_runs(normalized_text)
 
     # ── Step 5: Anti-obfuscation scan ─────────────────────────────────────────
-    # detect_all() returns decoded_text with base64/hex tokens replaced by
-    # their decoded plaintext. This is what Module 3 should scan.
     obfuscation_result = obfuscation_detect(normalized_text)
 
     obfuscation_flags = {
@@ -157,29 +177,263 @@ def run_ocr(
     print(f"\n[OCR] Extraction complete.")
     print(f"[OCR] Total words found       : {len(raw_df)}")
     print(f"[OCR] Words after filtering   : {len(filtered_df)}")
-    print(f"[OCR] Raw text preview        : {raw_text[:100]}{'...' if len(raw_text) > 100 else ''}")
-    print(f"[OCR] Normalized text preview : {normalized_text[:100]}{'...' if len(normalized_text) > 100 else ''}")
+    print(f"[OCR] Raw text preview        : {raw_text[:120]}{'...' if len(raw_text) > 120 else ''}")
+    print(f"[OCR] Normalized text preview : {normalized_text[:120]}{'...' if len(normalized_text) > 120 else ''}")
     print(f"[OCR] Obfuscation flags       : {obfuscation_flags}")
 
-    # The "text_for_detection" is the cleanest version:
-    # - normalized (homoglyphs cleaned)
-    # - encoded tokens replaced with decoded plaintext
-    # Module 3 should use this.
     text_for_detection = obfuscation_result["decoded_text"]
 
     return {
-        "text"             : raw_text,           # Original — unchanged for backward compat
-        "text_normalized"  : normalized_text,    # After homoglyph/ZWC cleaning
-        "text_for_detection": text_for_detection, # USE THIS in Module 3 — cleanest
-        "digit_runs"       : digit_runs,
-        "words"            : filtered_df,
-        "obfuscation"      : obfuscation_result,
-        "obfuscation_flags": obfuscation_flags,
+        "text"              : raw_text,
+        "text_normalized"   : normalized_text,
+        "text_for_detection": text_for_detection,
+        "digit_runs"        : digit_runs,
+        "words"             : filtered_df,
+        "obfuscation"       : obfuscation_result,
+        "obfuscation_flags" : obfuscation_flags,
     }
 
 
 # ─────────────────────────────────────────────
-# CHANNEL OCR — ANTI-OBFUSCATION
+# FIX v3: PARTIAL PEM DETECTOR
+# ─────────────────────────────────────────────
+
+def _looks_like_partial_pem(text: str, words_df: pd.DataFrame) -> bool:
+    """
+    Heuristic: did first-pass OCR catch PEM body content but miss the headers?
+
+    Returns True (trigger second pass) when ALL of:
+        1. Text contains base64-like tokens (likely key body lines were read)
+        2. Text does NOT contain PEM header markers (BEGIN/END or -----)
+        3. Word count is low — fewer tokens than a full PEM block would produce
+
+    This avoids running the second pass on normal documents.
+
+    Args:
+        text     : Raw text from first OCR pass.
+        words_df : Filtered word DataFrame from first pass.
+
+    Returns:
+        bool — True if second pass should be triggered.
+    """
+    has_base64_body = bool(re.search(r'[A-Za-z0-9+/]{15,}', text))
+    has_pem_header  = bool(re.search(r'(-{3,}|BEGIN|END\s+\w)', text, re.IGNORECASE))
+    low_word_count  = len(words_df) < 10
+
+    trigger = has_base64_body and not has_pem_header and low_word_count
+
+    if trigger:
+        print(f"[OCR] _looks_like_partial_pem → True "
+              f"(base64_body={has_base64_body}, pem_header={has_pem_header}, "
+              f"word_count={len(words_df)})")
+    return trigger
+
+
+# ─────────────────────────────────────────────
+# PEM HEADER PRE-PASS
+# ─────────────────────────────────────────────
+
+def _extract_pem_header_rows(df: pd.DataFrame) -> tuple:
+    """
+    Pre-pass: group tokens by line, merge any line whose joined text matches
+    a PEM header/footer pattern, and return them separately so they survive
+    the confidence filter.
+
+    Args:
+        df : Raw Tesseract DataFrame.
+
+    Returns:
+        (remaining_df, pem_rows)
+    """
+    if df.empty:
+        return df, []
+
+    df = df.sort_values(["top", "left"]).reset_index(drop=True)
+
+    lines        = []
+    current_line = [0]
+
+    for idx in range(1, len(df)):
+        prev_top = int(df.iloc[current_line[0]]["top"])
+        curr_top = int(df.iloc[idx]["top"])
+        if abs(curr_top - prev_top) < 20:
+            current_line.append(idx)
+        else:
+            lines.append(current_line)
+            current_line = [idx]
+    lines.append(current_line)
+
+    pem_rows     = []
+    drop_indices = set()
+
+    for line_idxs in lines:
+        tokens    = [str(df.iloc[i]["text"]).strip() for i in line_idxs]
+        line_text = " ".join(tokens)
+
+        if _PEM_LINE_RE.search(line_text):
+            merged   = re.sub(r'\s+', '', line_text)
+            avg_conf = sum(float(df.iloc[i]["conf"]) for i in line_idxs) / len(line_idxs)
+            first    = df.iloc[line_idxs[0]]
+
+            print(f"[OCR] PEM header pre-pass merged: '{line_text.strip()}' → '{merged}'")
+            pem_rows.append({
+                "word"  : merged,
+                "left"  : int(first["left"]),
+                "top"   : int(first["top"]),
+                "width" : -1,
+                "height": int(first["height"]),
+                "conf"  : avg_conf,
+            })
+            for i in line_idxs:
+                drop_indices.add(i)
+
+    remaining_df = df.drop(index=list(drop_indices)).reset_index(drop=True)
+    return remaining_df, pem_rows
+
+
+# ─────────────────────────────────────────────
+# FRAGMENT REASSEMBLY
+# ─────────────────────────────────────────────
+
+def reassemble_fragments(df: pd.DataFrame, confidence_threshold: int = 60) -> pd.DataFrame:
+    """
+    Filter and reassemble OCR tokens.
+
+    Processing order:
+        1. PEM header pre-pass  — merge header/footer fragments before filtering
+        2. High confidence      — kept as-is
+        3. Digit fragments      — spatially merged if they form a number
+        4. Base64-like tokens   — always preserved (v2)
+        5. Hex-like tokens      — always preserved (v2)
+        6. Dash tokens          — always preserved (likely PEM header fragment)
+        7. Everything else      — discarded as noise
+    """
+    df = df[df["text"].notna()]
+    df = df[df["text"].str.strip() != ""]
+    df = df.reset_index(drop=True)
+    df = df.sort_values(["top", "left"]).reset_index(drop=True)
+
+    total_before = len(df)
+
+    # ── PEM header pre-pass ───────────────────────────────────────────────────
+    df, pem_rows = _extract_pem_header_rows(df)
+    kept_rows    = list(pem_rows)
+    skip_indices = set()
+
+    i = 0
+    while i < len(df):
+        if i in skip_indices:
+            i += 1
+            continue
+
+        row       = df.iloc[i]
+        word_text = str(row["text"]).strip()
+        conf      = float(row["conf"])
+
+        # ── High confidence ───────────────────────────────────────────────────
+        if conf >= confidence_threshold:
+            kept_rows.append({
+                "word"  : word_text,
+                "left"  : int(row["left"]),
+                "top"   : int(row["top"]),
+                "width" : int(row["width"]),
+                "height": int(row["height"]),
+                "conf"  : conf,
+            })
+            i += 1
+            continue
+
+        # ── Low confidence: look-ahead spatial reassembly ─────────────────────
+        group_words   = [word_text]
+        group_confs   = [conf]
+        group_indices = [i]
+
+        j = i + 1
+        while j < min(i + 4, len(df)) and j not in skip_indices:
+            next_row   = df.iloc[j]
+            next_word  = str(next_row["text"]).strip()
+            next_conf  = float(next_row["conf"])
+
+            current_right  = int(row["left"]) + int(row["width"])
+            horizontal_gap = int(next_row["left"]) - current_right
+            vertical_diff  = abs(int(next_row["top"]) - int(row["top"]))
+
+            if horizontal_gap < 40 and vertical_diff < 15:
+                group_words.append(next_word)
+                group_confs.append(next_conf)
+                group_indices.append(j)
+                j += 1
+            else:
+                break
+
+        merged   = ''.join(group_words)
+        avg_conf = sum(group_confs) / len(group_confs)
+
+        # ── Case 1: Digit sequence ────────────────────────────────────────────
+        if re.match(r'^\d+$', merged) and len(merged) >= 4:
+            print(f"[OCR] Digit fragment reassembled: {group_words} → '{merged}' (avg conf: {avg_conf:.0f})")
+            kept_rows.append({
+                "word"  : merged,
+                "left"  : int(df.iloc[group_indices[0]]["left"]),
+                "top"   : int(df.iloc[group_indices[0]]["top"]),
+                "width" : int(df.iloc[group_indices[-1]]["left"])
+                          + int(df.iloc[group_indices[-1]]["width"])
+                          - int(df.iloc[group_indices[0]]["left"]),
+                "height": int(row["height"]),
+                "conf"  : avg_conf,
+            })
+            for idx in group_indices:
+                skip_indices.add(idx)
+
+        # ── Case 2: Base64-like token ─────────────────────────────────────────
+        elif re.match(r'^[A-Za-z0-9+/=]{6,}$', word_text):
+            print(f"[OCR] Base64-like token preserved (low conf {conf:.0f}): '{word_text[:40]}'")
+            kept_rows.append({
+                "word"  : word_text,
+                "left"  : int(row["left"]),
+                "top"   : int(row["top"]),
+                "width" : int(row["width"]),
+                "height": int(row["height"]),
+                "conf"  : conf,
+            })
+
+        # ── Case 3: Hex-like token ────────────────────────────────────────────
+        elif re.match(r'^[0-9a-fA-F]{8,}$', word_text):
+            print(f"[OCR] Hex-like token preserved (low conf {conf:.0f}): '{word_text[:40]}'")
+            kept_rows.append({
+                "word"  : word_text,
+                "left"  : int(row["left"]),
+                "top"   : int(row["top"]),
+                "width" : int(row["width"]),
+                "height": int(row["height"]),
+                "conf"  : conf,
+            })
+
+        # ── Case 4: Dash token — likely PEM header fragment ───────────────────
+        elif re.match(r'^-{3,}', word_text):
+            print(f"[OCR] Dash token preserved (low conf {conf:.0f}): '{word_text}'")
+            kept_rows.append({
+                "word"  : word_text,
+                "left"  : int(row["left"]),
+                "top"   : int(row["top"]),
+                "width" : int(row["width"]),
+                "height": int(row["height"]),
+                "conf"  : conf,
+            })
+
+        # ── Case 5: Noise — discard ───────────────────────────────────────────
+
+        i = j if len(group_indices) > 1 else i + 1
+
+    result_df = pd.DataFrame(kept_rows) if kept_rows else pd.DataFrame(
+        columns=["word", "left", "top", "width", "height", "conf"]
+    )
+    print(f"[OCR] reassemble_fragments: kept {len(result_df)}, dropped {total_before - len(result_df) + len(pem_rows)} of {total_before}")
+    return result_df
+
+
+# ─────────────────────────────────────────────
+# CHANNEL OCR
 # ─────────────────────────────────────────────
 
 def _run_channel_ocr(
@@ -188,18 +442,7 @@ def _run_channel_ocr(
     psm                  : int,
     confidence_threshold : int
 ) -> pd.DataFrame:
-    """
-    Run Tesseract on each colour channel image (R, G, B) separately.
-    Merge any tokens found in channels but NOT in the main OCR result
-    into the main DataFrame.
-
-    WHY: Attackers can write sensitive text using a single colour channel.
-    Grayscale OCR completely misses it. Channel OCR catches it.
-
-    Merged channel tokens are added WITHOUT bounding boxes (left/top/width/height = -1)
-    because their coordinates are in the channel's coordinate space, not the original.
-    They will appear in text but not be highlighted — acceptable trade-off.
-    """
+    """Run OCR on each colour channel and merge unique tokens."""
     if not channel_images:
         return main_df
 
@@ -209,7 +452,7 @@ def _run_channel_ocr(
     for ch_name, ch_image in channel_images.items():
         print(f"\n[OCR] Running channel OCR: {ch_name}")
         try:
-            ch_raw = _extract_word_data(ch_image, psm)
+            ch_raw      = _extract_word_data(ch_image, psm)
             ch_filtered = reassemble_fragments(ch_raw, confidence_threshold)
 
             if ch_filtered.empty:
@@ -222,7 +465,7 @@ def _run_channel_ocr(
                     existing_words.add(word)
                     new_rows.append({
                         "word"  : row["word"],
-                        "left"  : -1,   # No reliable coordinate in original image space
+                        "left"  : -1,
                         "top"   : -1,
                         "width" : -1,
                         "height": -1,
@@ -246,171 +489,17 @@ def _run_channel_ocr(
 # ─────────────────────────────────────────────
 
 def normalize_ocr_text(text: str) -> str:
-    """
-    Clean OCR text to remove deliberate obfuscation techniques.
-
-    Handles:
-        1. Zero-width / invisible Unicode characters
-        2. Unicode normalization (NFKC catches many homoglyphs automatically)
-        3. Homoglyph substitution (Cyrillic/Greek/fullwidth → Latin/ASCII)
-        4. Fragmented digit sequences ("9 1 8 3" → "9183")
-
-    Args:
-        text : Raw joined text from _build_text_string()
-
-    Returns:
-        Cleaned text string ready for anti_obfuscation and regex detection.
-    """
-
-    # Step 1: Strip zero-width and invisible characters
     for zwc in ZERO_WIDTH_CHARS:
         text = text.replace(zwc, '')
-
-    # Step 2: Unicode normalization — NFKC decomposes compatibility characters
-    # e.g. fullwidth letters, ligatures, some homoglyphs
     text = unicodedata.normalize('NFKC', text)
-
-    # Step 3: Homoglyph map — character-by-character substitution
     text = ''.join(HOMOGLYPH_MAP.get(ch, ch) for ch in text)
-
-    # Step 4: Rejoin fragmented digit sequences
-    # "9 1 8 3 0 0 7 4" → "91830074" (OCR spacing artifacts on ID numbers)
-    text = re.sub(r'(\d)\s+(\d)', r'\1\2', text)
-    # Run twice to catch multi-step fragments: "9 1 8 3" needs 3 passes
-    text = re.sub(r'(\d)\s+(\d)', r'\1\2', text)
-    text = re.sub(r'(\d)\s+(\d)', r'\1\2', text)
-
+    for _ in range(3):
+        text = re.sub(r'(\d)\s+(\d)', r'\1\2', text)
     return text
 
 
 def extract_digit_runs(text: str) -> list:
-    """
-    Extract all contiguous digit sequences from normalized text.
-    Used by Module 3 as a safer alternative to running Aadhaar/PAN
-    regex on noisy raw text.
-
-    Returns:
-        List of digit-only strings, e.g. ["9183", "0074", "6619", "1990"]
-    """
     return re.findall(r'\d+', text)
-
-
-# ─────────────────────────────────────────────
-# FRAGMENT REASSEMBLY — replaces old _filter_words()
-# ─────────────────────────────────────────────
-
-def reassemble_fragments(df: pd.DataFrame, confidence_threshold: int = 60) -> pd.DataFrame:
-    """
-    Improved word filtering that reassembles spatially adjacent digit fragments
-    before discarding low-confidence tokens.
-
-    WHY THIS MATTERS:
-        Aadhaar numbers like "9183 0074 6619" are sometimes OCR'd as:
-        "9", "18", "3", "00", "74", "66", "19" — each individually low-confidence.
-        The old filter would drop ALL of them. This function detects that they
-        form a digit group when concatenated and keeps the merged token.
-
-    Process:
-        1. Sort words by position (top-to-bottom, left-to-right)
-        2. For high-confidence words: keep as-is
-        3. For low-confidence words: check if spatially adjacent neighbours
-           form a digit sequence when merged. If yes → keep merged token.
-           If no → discard as noise.
-
-    Args:
-        df                   : Raw Tesseract DataFrame from _extract_word_data()
-        confidence_threshold : Words below this are candidates for reassembly or discard
-
-    Returns:
-        Filtered DataFrame with merged digit fragments where appropriate.
-    """
-    # Basic cleaning first
-    df = df[df["text"].notna()]
-    df = df[df["text"].str.strip() != ""]
-    df = df.reset_index(drop=True)
-
-    # Sort by reading order: top-to-bottom, left-to-right
-    df = df.sort_values(["top", "left"]).reset_index(drop=True)
-
-    kept_rows   = []
-    skip_indices = set()
-    total_before = len(df)
-
-    i = 0
-    while i < len(df):
-        if i in skip_indices:
-            i += 1
-            continue
-
-        row = df.iloc[i]
-        word_text = str(row["text"]).strip()
-        conf      = float(row["conf"])
-
-        if conf >= confidence_threshold:
-            # High confidence — keep directly
-            kept_rows.append({
-                "word"  : word_text,
-                "left"  : int(row["left"]),
-                "top"   : int(row["top"]),
-                "width" : int(row["width"]),
-                "height": int(row["height"]),
-                "conf"  : conf,
-            })
-            i += 1
-            continue
-
-        # Low confidence — try to reassemble with neighbours
-        group_words  = [word_text]
-        group_confs  = [conf]
-        group_indices = [i]
-
-        # Look ahead at next 3 tokens for spatial adjacency
-        j = i + 1
-        while j < min(i + 4, len(df)) and j not in skip_indices:
-            next_row  = df.iloc[j]
-            next_word = str(next_row["text"]).strip()
-            next_conf = float(next_row["conf"])
-
-            # Horizontal gap between current group end and next word start
-            current_right = int(row["left"]) + int(row["width"])
-            horizontal_gap = int(next_row["left"]) - current_right
-            vertical_diff  = abs(int(next_row["top"]) - int(row["top"]))
-
-            # Tokens are spatially adjacent if gap < 40px and same line (vertical < 15px)
-            if horizontal_gap < 40 and vertical_diff < 15:
-                group_words.append(next_word)
-                group_confs.append(next_conf)
-                group_indices.append(j)
-                j += 1
-            else:
-                break
-
-        # Check if group forms a valid digit sequence
-        merged = ''.join(group_words)
-        if re.match(r'^\d+$', merged) and len(merged) >= 4:
-            # Looks like a fragmented number — keep it merged
-            avg_conf = sum(group_confs) / len(group_confs)
-            print(f"[OCR] Fragment reassembled: {group_words} → '{merged}' (avg conf: {avg_conf:.0f})")
-            kept_rows.append({
-                "word"  : merged,
-                "left"  : int(df.iloc[group_indices[0]]["left"]),
-                "top"   : int(df.iloc[group_indices[0]]["top"]),
-                "width" : int(df.iloc[group_indices[-1]]["left"])
-                          + int(df.iloc[group_indices[-1]]["width"])
-                          - int(df.iloc[group_indices[0]]["left"]),
-                "height": int(row["height"]),
-                "conf"  : avg_conf,
-            })
-            for idx in group_indices:
-                skip_indices.add(idx)
-        # else: low-confidence, non-digit → discard as noise
-
-        i = j if len(group_indices) > 1 else i + 1
-
-    result_df = pd.DataFrame(kept_rows)
-    dropped   = total_before - len(result_df)
-    print(f"[OCR] reassemble_fragments: kept {len(result_df)}, dropped {dropped} of {total_before}")
-    return result_df
 
 
 # ─────────────────────────────────────────────
@@ -422,17 +511,15 @@ def _configure_tesseract() -> None:
         if not os.path.exists(TESSERACT_PATH):
             raise RuntimeError(
                 f"Tesseract not found at: {TESSERACT_PATH}\n"
-                "Please:\n"
-                "  1. Download from: https://github.com/UB-Mannheim/tesseract/wiki\n"
-                "  2. Install it\n"
-                "  3. Update TESSERACT_PATH in modules/ocr_engine.py"
+                "  1. Download: https://github.com/UB-Mannheim/tesseract/wiki\n"
+                "  2. Install and update TESSERACT_PATH in ocr_engine.py"
             )
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
 
 def _validate_image(image: np.ndarray) -> None:
     if image is None:
-        raise ValueError("[OCR] Input image is None. Pass the output of preprocess_image().")
+        raise ValueError("[OCR] Input image is None.")
     if not isinstance(image, np.ndarray):
         raise ValueError(f"[OCR] Expected numpy array, got {type(image)}.")
     print(f"[OCR] Input image validated. Shape: {image.shape} | dtype: {image.dtype}")
@@ -458,7 +545,6 @@ def _build_text_string(df: pd.DataFrame) -> str:
 
 
 def _compute_low_conf_ratio(raw_df: pd.DataFrame, filtered_df: pd.DataFrame) -> float:
-    """Ratio of words dropped vs total. High ratio signals possible obfuscation."""
     if len(raw_df) == 0:
         return 0.0
     dropped = len(raw_df) - len(filtered_df)
@@ -470,19 +556,13 @@ def _compute_low_conf_ratio(raw_df: pd.DataFrame, filtered_df: pd.DataFrame) -> 
 # ─────────────────────────────────────────────
 
 def find_word_boxes(words_df: pd.DataFrame, target_words: list) -> pd.DataFrame:
-    """
-    Return bounding box rows for words matching target_words.
-    Excludes channel-OCR tokens (left == -1) since they have no valid coordinates.
-    """
     if not target_words or words_df.empty:
         return pd.DataFrame()
-
     matched = words_df[
         words_df["word"].isin(target_words) &
-        (words_df["left"] >= 0)   # Exclude channel-OCR tokens (no valid bbox)
+        (words_df["left"] >= 0)
     ].copy()
-
-    print(f"[OCR] find_word_boxes: {len(matched)} word boxes matched for highlighting.")
+    print(f"[OCR] find_word_boxes: {len(matched)} word boxes matched.")
     return matched
 
 
@@ -503,10 +583,12 @@ if __name__ == "__main__":
     img_path = sys.argv[1]
 
     print("\n── Step 1: Preprocessing ──")
-    clean, scale_factor, channel_images = preprocess_image(img_path, save_debug=False)
+    # FIX v3: Unpack 4 return values — gray_raw is new
+    clean, scale_factor, channel_images, gray_raw = preprocess_image(img_path, save_debug=False)
 
     print("\n── Step 2: Running OCR ──")
-    result = run_ocr(clean, channel_images=channel_images)
+    # FIX v3: Pass gray_raw to enable second-pass PEM recovery
+    result = run_ocr(clean, channel_images=channel_images, gray_raw=gray_raw)
 
     print("\n── Full Extracted Text (raw) ──")
     print(result["text"])
@@ -518,7 +600,13 @@ if __name__ == "__main__":
     print(result["digit_runs"])
 
     print("\n── Obfuscation Flags ──")
-    print(result["obfuscation_flags"])
+    for flag, value in result["obfuscation_flags"].items():
+        icon = "⚠️ " if value and flag != "low_conf_ratio" else "   "
+        print(f"  {icon}{flag}: {value}")
+
+    print("\n── Obfuscation Findings ──")
+    for f in result["obfuscation"].get("findings", []):
+        print(f"  → {f['technique']:<28} | risk: {f['risk']} | action: {f['action']}")
 
     print("\n── Word Table (first 10 rows) ──")
     print(result["words"].head(10).to_string(index=False))
