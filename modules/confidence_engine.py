@@ -258,6 +258,8 @@ def _score_finding(
         WEIGHTS["ocr"]   * ocr_score
     )
     unified_score = round(min(1.0, max(0.0, unified_score)), 3)
+    if m.get("fp_risk") is True:
+        unified_score = min(unified_score, 0.29)
 
     # ── Risk level ────────────────────────────────────────────────────────────
     risk_level = _score_to_risk(unified_score)

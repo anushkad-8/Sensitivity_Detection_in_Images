@@ -119,9 +119,12 @@ def run_pipeline(
     ocr_result     = run_ocr(clean_image, psm=psm, confidence_threshold=conf)
     extracted_text = ocr_result["text"]
     words_df       = ocr_result["words"]
-    total_words    = len(words_df)
+    total_words    = ocr_result.get("filtered_word_count", len(words_df))
+    raw_words      = ocr_result.get("raw_word_count", total_words)
+    dropped_words  = ocr_result.get("dropped_words", max(0, raw_words - total_words))
     _print_step_done(2, time.time() - t,
-                     f"{total_words} words | {len(extracted_text)} chars")
+                     f"{total_words}/{raw_words} words kept | "
+                     f"{dropped_words} dropped | {len(extracted_text)} chars")
 
     if not extracted_text.strip():
         _print_warn("OCR returned empty text — try --psm 11 or lower --conf")
@@ -168,15 +171,11 @@ def run_pipeline(
     _print_step(5, 8, "Unified confidence scoring")
     t = time.time()
 
-    # Calculate dropped words for OCR quality assessment
-    raw_total    = total_words + (len(ocr_result["words"]) if hasattr(ocr_result, "__len__") else 0)
-    dropped_est  = max(0, raw_total - total_words)
-
     scored_result = score_findings(
         nlp_result     = nlp_result,
         words_df       = words_df,
         ocr_word_count = total_words,
-        dropped_words  = dropped_est,
+        dropped_words  = dropped_words,
     )
     _print_step_done(5, time.time() - t,
                      f"overall_risk={scored_result['overall_risk']} | "

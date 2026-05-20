@@ -36,7 +36,7 @@ TRAINING RECORD SCHEMA:
         finding_type    : pan / email / dob / person / document_label / etc.
         finding_value   : MASKED — never stores raw sensitive value
         ocr_text_window : ±10 words around the finding (context for NLP training)
-        full_ocr_text   : complete OCR output (for document-level models)
+        full_ocr_text   : sanitized OCR output (masked, bounded length)
         context_words   : list of surrounding words
         regex_confidence: high / medium / low / none (if NLP-only finding)
         nlp_confidence  : high / medium / low / none (if regex-only)
@@ -51,7 +51,7 @@ TRAINING RECORD SCHEMA:
 PRIVACY DESIGN:
     finding_value is ALWAYS masked before storage.
     The training store contains NO raw sensitive values.
-    It stores context windows and labels only — safe to use for training
+    It stores sanitized context windows and labels only — safe to use for training
     without exposing the original sensitive data.
 """
 
@@ -77,6 +77,7 @@ STORE_PATHS = {
 
 # Stats file — tracks counts per store, per type
 STATS_FILE = os.path.join(TRAINING_DIR, "dataset_stats.json")
+MAX_STORED_TEXT_CHARS = 1200
 
 
 # ─────────────────────────────────────────────
@@ -144,17 +145,19 @@ def save_scan_records(
     auto_labeled = 0
     pending     = 0
 
-    # Combine regex + NLP matches into one list
+    # Combine regex + NLP matches into one de-duplicated list.
     all_matches = list(detection_result.get("matches", []))
     if nlp_result:
         all_matches.extend(nlp_result.get("new_findings", []))
+    all_matches = _dedupe_matches(all_matches)
+    safe_ocr_text = _sanitize_training_text(ocr_text, all_matches)
 
     if not all_matches:
         # Save a "clean image" record — also valuable for training
         record = _build_record(
             image_name    = image_name,
             match         = None,
-            ocr_text      = ocr_text,
+            ocr_text      = safe_ocr_text,
             is_clean_image = True
         )
         _write_record(record)
@@ -166,7 +169,7 @@ def save_scan_records(
         record = _build_record(
             image_name = image_name,
             match      = match,
-            ocr_text   = ocr_text
+            ocr_text   = safe_ocr_text
         )
 
         # Determine label
@@ -463,6 +466,66 @@ def print_dataset_stats() -> None:
 # RECORD BUILDER
 # ─────────────────────────────────────────────
 
+def _dedupe_matches(matches: list) -> list:
+    """Remove duplicate findings when scored_result already includes NLP output."""
+    deduped = []
+    seen = set()
+    for match in matches:
+        key = (
+            match.get("type", ""),
+            str(match.get("value", "")),
+            match.get("source", "regex"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(match)
+    return deduped
+
+
+def _sanitize_training_text(ocr_text: str, matches: list) -> str:
+    """
+    Mask detected and common sensitive values before writing training JSONL.
+    This keeps context useful for model training without storing raw secrets.
+    """
+    if not ocr_text:
+        return ""
+
+    safe_text = str(ocr_text)
+
+    for match in matches:
+        value = str(match.get("value", "")).strip()
+        if not value:
+            continue
+        placeholder = _mask_for_training(value, match.get("type", "sensitive"))
+        safe_text = safe_text.replace(value, placeholder)
+
+    generic_patterns = [
+        ("EMAIL", r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+        ("PAN", r"\b[A-Z]{5}[0-9]{4}[A-Z]\b"),
+        ("PASSPORT", r"\b[A-Z][0-9]{7}\b"),
+        ("AADHAAR", r"\b(?:\d[ -]?){12}\b"),
+        ("BANK_CARD", r"\b(?:\d[ -]?){13,19}\b"),
+        ("PHONE", r"\b(?:\+91[ -]?)?[6-9]\d{9}\b"),
+    ]
+
+    for label, pattern in generic_patterns:
+        safe_text = re.sub(
+            pattern,
+            lambda m, t=label: _mask_for_training(m.group(0), t.lower()),
+            safe_text,
+        )
+
+    return _limit_training_text(safe_text)
+
+
+def _limit_training_text(text: str) -> str:
+    """Bound stored OCR text size to reduce privacy exposure and dataset bloat."""
+    if not text:
+        return ""
+    return str(text)[:MAX_STORED_TEXT_CHARS]
+
+
 def _build_record(
     image_name     : str,
     match          : Optional[dict],
@@ -479,13 +542,14 @@ def _build_record(
     timestamp = datetime.now(timezone.utc).isoformat()
 
     if is_clean_image or match is None:
+        safe_text = _limit_training_text(ocr_text)
         return {
             "record_id"        : _generate_id(image_name + timestamp),
             "source_image"     : image_name,
             "finding_type"     : "clean",
             "finding_value"    : "N/A",
-            "ocr_text_window"  : ocr_text[:300] if ocr_text else "",
-            "full_ocr_text"    : ocr_text,
+            "ocr_text_window"  : safe_text[:300] if safe_text else "",
+            "full_ocr_text"    : safe_text,
             "context_words"    : [],
             "regex_confidence" : "none",
             "nlp_confidence"   : "none",
@@ -497,21 +561,20 @@ def _build_record(
             "notes"            : "Clean image — no sensitive content detected",
         }
 
-    # Extract context window (±10 words around the match value)
-    context_window, context_words = _extract_context(
-        ocr_text, match["value"], window=10
-    )
-
-    # Mask the finding value — never store raw
+    # Extract context around the masked placeholder, not the raw value.
     masked_value = _mask_for_training(match["value"], match["type"])
+    safe_text = _limit_training_text(ocr_text)
+    context_window, context_words = _extract_context(
+        safe_text, masked_value, window=10
+    )
 
     return {
         "record_id"        : _generate_id(image_name + match["value"] + timestamp),
         "source_image"     : image_name,
         "finding_type"     : match["type"],
         "finding_value"    : masked_value,          # MASKED — no raw value stored
-        "ocr_text_window"  : context_window,        # context for NLP training
-        "full_ocr_text"    : ocr_text,              # full document text
+        "ocr_text_window"  : context_window,        # sanitized context for training
+        "full_ocr_text"    : safe_text,             # sanitized document text
         "context_words"    : context_words,         # surrounding word list
         "regex_confidence" : match.get("confidence", "none"),
         "nlp_confidence"   : match.get("nlp_confidence", "none"),

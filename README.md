@@ -1,5 +1,5 @@
 # OCR Sensitive Information Detector — Image DLP
-**Barclays Image DLP Project — Phase 1 Complete**
+**Barclays Image DLP Project — OCR + NLP + Vision DLP**
 
 A fully local, lightweight DLP pipeline that detects sensitive information
 inside images using OCR + regex classification.
@@ -116,6 +116,9 @@ Options:
                                       11 = sparse text (ID cards, forms)
                                       3  = auto-detect
   --conf      0-100                 OCR word confidence filter (default: 60)
+  --no-nlp                          Skip NLP classification
+  --no-ner                          Skip NER only
+  --no-vision                       Skip Phase 3 vision classification
   --no-encrypt                      Plain JSON report (debug only)
   --debug                           Save preprocessing step images
 ```
@@ -150,6 +153,11 @@ python tests/test_ocr_engine.py      input/your_image.jpg
 python tests/test_sensitive_detector.py
 python tests/test_annotator.py       input/your_image.jpg
 python tests/test_reporter.py
+python tests/test_confidence_engine.py
+python tests/test_vision_classifier.py
+python tests/test_ocr_quality_metadata.py
+python tests/test_ocr_failure_scenarios.py
+python tests/test_training_store_security.py
 ```
 
 ---
@@ -159,6 +167,6 @@ python tests/test_reporter.py
 | Phase | What | Status |
 |---|---|---|
 | **Phase 1** | OCR + Regex DLP + Annotate + Encrypted Report | ✅ **Complete** |
-| **Phase 2** | + NLP Classifier (BERT) — contextual sensitivity | 🔜 Next |
-| **Phase 3** | + Vision Models (CLIP / Detectron2) | 🔜 Upcoming |
-| **Phase 4** | + Confidence Engine + OCR failure test suite | 🔜 Upcoming |
+| **Phase 2** | + NLP classifier/context verification/document labels | ✅ **Complete** |
+| **Phase 3** | + Vision classifier + OCR failure risk | ✅ **Complete** |
+| **Hardening** | + Confidence engine + secure training storage + OCR failure tests | ✅ **Complete** |

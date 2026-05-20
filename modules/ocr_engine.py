@@ -86,15 +86,22 @@ def run_ocr(
 
     # ── Step 4: Build clean full-text string from remaining words ─────────────
     full_text = _build_text_string(filtered_df)
+    quality = _build_quality_metadata(raw_df, filtered_df)
 
     print(f"\n[OCR] Extraction complete.")
-    print(f"[OCR] Total words found     : {len(raw_df)}")
-    print(f"[OCR] Words after filtering : {len(filtered_df)}")
+    print(f"[OCR] Total words found     : {quality['raw_word_count']}")
+    print(f"[OCR] Words after filtering : {quality['filtered_word_count']}")
+    print(f"[OCR] Dropped word ratio    : {quality['dropped_word_ratio']:.0%}")
     print(f"[OCR] Extracted text preview: {full_text[:120]}{'...' if len(full_text) > 120 else ''}")
 
     return {
-        "text" : full_text,
-        "words": filtered_df
+        "text"               : full_text,
+        "words"              : filtered_df,
+        "raw_words"          : _normalise_word_rows(raw_df),
+        "raw_word_count"     : quality["raw_word_count"],
+        "filtered_word_count": quality["filtered_word_count"],
+        "dropped_words"      : quality["dropped_words"],
+        "dropped_word_ratio" : quality["dropped_word_ratio"],
     }
 
 
@@ -213,6 +220,33 @@ def _filter_words(df: pd.DataFrame, confidence_threshold: int) -> pd.DataFrame:
     df = df.rename(columns={"text": "word"})
 
     return df
+
+
+def _normalise_word_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Return non-empty OCR word rows before confidence filtering."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["word", "left", "top", "width", "height", "conf"])
+
+    rows = df[df["text"].notna()].copy()
+    rows = rows[rows["text"].astype(str).str.strip() != ""]
+    rows = rows.rename(columns={"text": "word"})
+    return rows.reset_index(drop=True)
+
+
+def _build_quality_metadata(raw_df: pd.DataFrame, filtered_df: pd.DataFrame) -> dict:
+    """Build OCR quality counters used by the confidence engine."""
+    raw_words = _normalise_word_rows(raw_df)
+    raw_count = len(raw_words)
+    filtered_count = len(filtered_df) if filtered_df is not None else 0
+    dropped_words = max(0, raw_count - filtered_count)
+    dropped_ratio = dropped_words / raw_count if raw_count > 0 else 0.0
+
+    return {
+        "raw_word_count"     : raw_count,
+        "filtered_word_count": filtered_count,
+        "dropped_words"      : dropped_words,
+        "dropped_word_ratio" : round(float(dropped_ratio), 3),
+    }
 
 
 def _build_text_string(df: pd.DataFrame) -> str:
