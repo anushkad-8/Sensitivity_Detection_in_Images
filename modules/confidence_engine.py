@@ -423,6 +423,25 @@ def _build_score_summary(scored_matches: list) -> dict:
     return {k: v for k, v in summary.items() if v > 0}
 
 
+def ocr_has_meaningful_evidence(
+    ocr_word_count: int,
+    dropped_words : int,
+    words_df,
+) -> bool:
+    """
+    Return True if OCR produced enough reliable text to act as primary evidence.
+
+    Used by _merge_vision_result to gate vision-only findings.
+    Criteria:
+      - at least 5 words retained after confidence filtering, AND
+      - OCR quality is not 'poor' (mean confidence ≥ 50 after drop-ratio penalty)
+    """
+    if ocr_word_count < 5:
+        return False
+    quality, _ = _assess_ocr_quality(words_df, ocr_word_count, dropped_words)
+    return quality != "poor"
+
+
 # ─────────────────────────────────────────────
 # UTILITY — for main.py console display
 # ─────────────────────────────────────────────

@@ -177,6 +177,9 @@ def run_pipeline(
         ocr_word_count = total_words,
         dropped_words  = dropped_words,
     )
+    # Stash ocr_word_count so _merge_vision_result can apply the evidence gate
+    scored_result["_ocr_word_count"]     = total_words
+    scored_result["_ocr_raw_word_count"] = raw_words
     _print_step_done(5, time.time() - t,
                      f"overall_risk={scored_result['overall_risk']} | "
                      f"ocr_quality={scored_result['ocr_quality']}")
@@ -332,34 +335,153 @@ def _exit_error(msg):
 
 
 def _merge_vision_result(scored_result: dict, vision_result: dict) -> dict:
-    """Merge Phase 3 vision findings into the scored pipeline result."""
+    """
+    Merge Phase 3 vision findings into the scored pipeline result using
+    weighted evidence-fusion rather than naive appending.
+
+    Architecture principle:
+        OCR + Regex + NLP  →  PRIMARY evidence   (can independently trigger alert)
+        Vision             →  SUPPORTING evidence (modulates score, rarely triggers alone)
+
+    Decision rules
+    ──────────────
+    Case 1 — OCR/NLP found evidence AND vision agrees
+        Vision boosts the overall score by VISION_BOOST_FACTOR.
+        Overall risk can escalate by at most one level.
+
+    Case 2 — OCR failed / low words AND vision flags a sensitive document type
+              AND the vision model is not a low-confidence heuristic fallback
+        Vision is allowed to contribute a capped MEDIUM finding so the image
+        is still flagged for human review — not silently passed.
+        This preserves true-positive detection of blurry IDs / scanned docs.
+
+    Case 3 — OCR found nothing AND vision-only detection from heuristic fallback
+        Vision finding is injected as REVIEW (not HIGH/CRITICAL) with fp_risk=True.
+        The image is queued for analyst review without raising a false alarm.
+
+    Case 4 — OCR found nothing AND vision document_type == "unknown"
+        Vision contributes nothing.  Result unchanged.
+
+    In ALL cases:
+        is_sensitive is driven by OCR/NLP matches OR by an escalated vision
+        finding that passes the evidence gate.  A lone heuristic vision finding
+        never sets is_sensitive=True on its own.
+    """
+    # ── Constants ──────────────────────────────────────────────────────────────
+    VISION_BOOST_FACTOR      = 0.08   # score boost when vision corroborates OCR
+    VISION_SOLO_CAP_SCORE    = 0.45   # max unified_score for vision-only findings (below MEDIUM=0.50)
+    VISION_SOLO_FALLBACK_CAP = 0.28   # max score when backend is heuristic fallback (→ REVIEW)
+    OCR_LOW_WORD_THRESHOLD   = 5      # filtered words below this → OCR is sparse
+    OCR_RAW_WORD_THRESHOLD   = 8      # raw words below this → Tesseract truly found little text
+    MIN_VISION_CONF_SOLO     = 0.50   # vision must clear this confidence to solo-contribute
+
     merged = dict(scored_result)
-    matches = list(merged.get("matches", []))
+    ocr_matches  = list(merged.get("matches", []))
+    has_ocr_evidence = bool(ocr_matches)  # any OCR/NLP/regex finding exists
 
-    for finding in vision_result.get("vision_findings", []):
+    is_fallback    = vision_result.get("fallback", True)
+    doc_type       = vision_result.get("document_type", "unknown")
+    vision_conf    = float(vision_result.get("type_confidence", 0.0))
+    ocr_failure    = vision_result.get("ocr_failure_risk", False)
+    ocr_word_count = merged.get("_ocr_word_count", 0)
+    ocr_raw_count  = merged.get("_ocr_raw_word_count", ocr_word_count)
+
+    # TRUE OCR failure: Tesseract found almost no text at all (raw_words < threshold).
+    # NOISY OCR: Tesseract found words but filtering removed them (raw high, filtered low).
+    # Only true OCR failure justifies elevating a vision-only finding above REVIEW.
+    ocr_truly_failed = ocr_word_count < OCR_LOW_WORD_THRESHOLD and ocr_raw_count < OCR_RAW_WORD_THRESHOLD
+    ocr_sparse       = ocr_word_count < OCR_LOW_WORD_THRESHOLD
+
+    vision_findings = vision_result.get("vision_findings", [])
+
+    # ── Case 4: vision found nothing meaningful ────────────────────────────────
+    if doc_type == "unknown" and not ocr_failure:
+        merged["vision_result"] = vision_result
+        return merged
+
+    new_vision_matches = []
+
+    for finding in vision_findings:
         vf = dict(finding)
-        score = float(vf.get("vision_confidence", vision_result.get("type_confidence", 0.0)))
-        sensitivity = vf.get("sensitivity_level", vision_result.get("sensitivity_level", "LOW"))
-        risk_level = sensitivity if sensitivity in ("CRITICAL", "HIGH", "MEDIUM", "LOW") else "LOW"
+        raw_sensitivity = vf.get("sensitivity_level", vision_result.get("sensitivity_level", "LOW"))
+        raw_vision_conf = float(vf.get("vision_confidence", vision_conf))
 
-        vf["unified_score"] = round(min(1.0, max(0.0, score)), 3)
-        vf["risk_level"] = risk_level
-        vf["score_detail"] = {
-            "vision_score": vf["unified_score"],
-            "model_used"  : vision_result.get("model_used", "opencv_heuristics"),
-            "fallback"    : vision_result.get("fallback", True),
-        }
+        # ── Case 1: OCR/NLP has evidence → vision corroborates ────────────────
+        if has_ocr_evidence:
+            # Boost existing OCR-based scores instead of adding a new finding.
+            # Only boost if vision is confident and agrees this is a sensitive doc.
+            if raw_vision_conf >= MIN_VISION_CONF_SOLO and raw_sensitivity in ("HIGH", "CRITICAL", "MEDIUM"):
+                for m in ocr_matches:
+                    boosted = min(1.0, m.get("unified_score", 0.0) + VISION_BOOST_FACTOR)
+                    m["unified_score"] = round(boosted, 3)
+                    # Re-derive risk level with the same thresholds used by confidence_engine
+                    m["risk_level"] = _score_to_risk_level(boosted)
+                    m.setdefault("score_detail", {})["vision_boost"] = VISION_BOOST_FACTOR
+                    m["score_detail"]["vision_type"]  = doc_type
+                    m["score_detail"]["vision_conf"]  = raw_vision_conf
+            # Do NOT add an independent vision finding — OCR evidence is primary.
+            continue
+
+        # ── Cases 2 & 3: No OCR evidence (vision-only path) ───────────────────
         vf.setdefault("nlp_confidence", "none")
-        vf.setdefault("fp_risk", False)
-        matches.append(vf)
 
-    merged["matches"] = matches
-    merged["total"] = len(matches)
-    merged["is_sensitive"] = bool(matches)
-    merged["overall_risk"] = _highest_risk(matches)
-    merged["score_summary"] = _score_summary(matches)
-    merged["vision_result"] = vision_result
+        if ocr_truly_failed and not is_fallback and raw_vision_conf >= MIN_VISION_CONF_SOLO:
+            # Case 2: OCR legitimately failed on a structured document + vision
+            #         is confident + using a real model (not pure heuristic).
+            #         Contribute a MEDIUM finding to flag for analyst review.
+            capped_score = min(raw_vision_conf, VISION_SOLO_CAP_SCORE)
+            vf["unified_score"] = round(capped_score, 3)
+            vf["risk_level"]    = _score_to_risk_level(capped_score)   # ≤ MEDIUM
+            vf["fp_risk"]       = False
+            vf["vision_solo"]   = True
+            vf["vision_evidence_gate"] = "ocr_failure_confirmed"
+        else:
+            # Case 3: Heuristic or low-confidence fallback with no OCR support.
+            #         Cap at REVIEW and mark fp_risk so analysts can review.
+            if is_fallback:
+                capped_score = min(raw_vision_conf, VISION_SOLO_FALLBACK_CAP)
+            else:
+                capped_score = min(raw_vision_conf, VISION_SOLO_CAP_SCORE)
+            vf["unified_score"] = round(capped_score, 3)
+            vf["risk_level"]    = "REVIEW"
+            vf["fp_risk"]       = True
+            vf["vision_solo"]   = True
+            vf["vision_evidence_gate"] = "heuristic_only_no_ocr"
+
+        vf["score_detail"] = {
+            "vision_score"    : raw_vision_conf,
+            "capped_score"    : vf["unified_score"],
+            "model_used"      : vision_result.get("model_used", "opencv_heuristics"),
+            "fallback"        : is_fallback,
+            "ocr_failure_risk": ocr_failure,
+            "evidence_gate"   : vf.get("vision_evidence_gate"),
+        }
+        new_vision_matches.append(vf)
+
+    # ── Assemble final match list ──────────────────────────────────────────────
+    all_matches = ocr_matches + new_vision_matches
+
+    # is_sensitive: driven by OCR/NLP, OR by a non-REVIEW vision finding
+    #   (Case 2 only — OCR failure with confident non-fallback model)
+    non_review_vision = [m for m in new_vision_matches if m.get("risk_level") != "REVIEW"]
+    is_sensitive = has_ocr_evidence or bool(non_review_vision)
+
+    merged["matches"]      = all_matches
+    merged["total"]        = len(all_matches)
+    merged["is_sensitive"] = is_sensitive
+    merged["overall_risk"] = _highest_risk(all_matches) if is_sensitive else "NONE"
+    merged["score_summary"]= _score_summary(all_matches)
+    merged["vision_result"]= vision_result
     return merged
+
+
+def _score_to_risk_level(score: float) -> str:
+    """Mirror the confidence_engine thresholds so vision-boosted scores map consistently."""
+    if score >= 0.85: return "CRITICAL"
+    if score >= 0.70: return "HIGH"
+    if score >= 0.50: return "MEDIUM"
+    if score >= 0.30: return "LOW"
+    return "REVIEW"
 
 
 def _highest_risk(matches: list) -> str:

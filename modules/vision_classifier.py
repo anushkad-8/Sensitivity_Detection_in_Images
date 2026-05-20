@@ -440,15 +440,20 @@ def _build_result(
     findings = []
     if document_type != "unknown" or ocr_failure_risk:
         findings.append({
-            "type"             : "document_type",
-            "value"            : document_type,
-            "tokens"           : [],
-            "confidence"       : _confidence_label(type_confidence),
-            "source"           : "vision",
-            "vision_confidence": type_confidence,
-            "sensitivity_level": sensitivity_level,
-            "ocr_failure_risk" : ocr_failure_risk,
-            "fp_risk"          : False,
+            "type"               : "document_type",
+            "value"              : document_type,
+            "tokens"             : [],
+            "confidence"         : _confidence_label(type_confidence),
+            "source"             : "vision",
+            "vision_confidence"  : type_confidence,
+            "sensitivity_level"  : sensitivity_level,
+            "ocr_failure_risk"   : ocr_failure_risk,
+            "fp_risk"            : False,
+            # Evidence-fusion metadata: lets _merge_vision_result gate solo vision findings
+            "vision_is_fallback" : fallback,
+            "vision_model_used"  : model_used,
+            # A solo vision finding should never exceed MEDIUM without OCR corroboration
+            "vision_solo_capped" : True,
         })
 
     return {

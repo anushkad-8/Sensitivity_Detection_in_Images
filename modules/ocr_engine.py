@@ -203,6 +203,10 @@ def _filter_words(df: pd.DataFrame, confidence_threshold: int) -> pd.DataFrame:
 
     # Filter 1: Remove empty/whitespace text
     df = df[df["text"].notna()]
+    # Coerce to string first — Tesseract occasionally returns int/float
+    # in the 'text' column when the output has only layout/header rows.
+    df = df.copy()
+    df["text"] = df["text"].astype(str)
     df = df[df["text"].str.strip() != ""]
 
     before_conf_filter = len(df)
