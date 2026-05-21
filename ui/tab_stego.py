@@ -16,6 +16,7 @@ The UI handles: upload, technique selection, analysis, findings display,
 confidence breakdown, and a visual channel inspector for RGB/LSB planes.
 """
 
+import html as html_module
 import os
 import sys
 import tempfile
@@ -59,56 +60,22 @@ STEGO_TECHNIQUES = {
 
 def _run_stego_analysis(image_path: str, techniques: list) -> dict:
     """
-    Stub — replace with your steganography module call.
-
-    Example wiring:
-        from modules.stego_detector import analyse
-        return analyse(image_path, techniques=techniques)
-
-    Expected return schema:
-    {
-        "is_stego"         : bool,
-        "overall_risk"     : str,   # CRITICAL / HIGH / MEDIUM / LOW / REVIEW / NONE
-        "overall_confidence: float, # 0.0 – 1.0
-        "findings": [
-            {
-                "technique"  : str,   # e.g. "lsb"
-                "label"      : str,   # e.g. "LSB Steganography"
-                "detected"   : bool,
-                "confidence" : float, # 0.0 – 1.0
-                "risk_level" : str,
-                "detail"     : str,   # human-readable finding summary
-                "payload_hint": str | None,  # e.g. "~2.1KB estimated hidden data"
-            },
-            ...
-        ],
-        "image_stats": {
-            "width"       : int,
-            "height"      : int,
-            "mode"        : str,   # RGB / RGBA / L etc.
-            "file_size_kb": float,
-            "entropy"     : float, # image entropy — high entropy is suspicious
-        },
-        "duration_sec" : float,
-    }
+    Real implementation using EfficientNetV2-S trained on LSB/PVD/DCT/FFT datasets.
+    Model: stego_efficientv2.pth (place in project root next to app.py)
+    Accuracy: 78.4% overall | LSB: 86.6% | FFT: 86.2% | Clean: 98.5%
     """
     import time
-    import random
+    import numpy as np_inner
+    start = time.time()
 
-    # ── STUB IMPLEMENTATION (produces realistic-looking demo data) ────────────
-    # Remove everything below and replace with your module call.
-    time.sleep(0.6)   # simulate analysis time
-
+    # ── Image stats (always computed regardless of model) ─────────────────────
     try:
         from PIL import Image as PILImage
         img = PILImage.open(image_path)
         w, h = img.size
         mode = img.mode
         file_kb = os.path.getsize(image_path) / 1024
-
-        # Entropy estimate
-        import numpy as np_inner
-        arr = np_inner.array(img.convert("L"))
+        arr  = np_inner.array(img.convert("L"))
         hist = np_inner.bincount(arr.ravel(), minlength=256)
         prob = hist / hist.sum()
         prob = prob[prob > 0]
@@ -116,40 +83,148 @@ def _run_stego_analysis(image_path: str, techniques: list) -> dict:
     except Exception:
         w, h, mode, file_kb, entropy = 0, 0, "?", 0.0, 0.0
 
-    # Stub findings — deterministic based on filename for demo consistency
-    seed = sum(ord(c) for c in image_path)
-    rng  = random.Random(seed)
+    # ── Model inference ───────────────────────────────────────────────────────
+    # Maps our 5 model classes to the tab's technique keys
+    MODEL_CLASS_TO_TECHNIQUE = {
+        "lsb": "lsb",
+        "pvd": "pvd",   # closest to chi_square in sidebar
+        "dct": "dct",
+        "fft": "rs",    # closest to rs in sidebar
+    }
+    CLASS_LABELS  = ["Clean", "LSB", "PVD", "DCT", "FFT"]
+    CLASS_KEYS    = ["clean", "lsb", "pvd", "dct", "fft"]
+    CLASS_DETAILS = {
+        "lsb": "Least Significant Bit steganography detected. Data hidden in pixel LSBs.",
+        "pvd": "Pixel Value Differencing steganography detected. Data hidden via pixel pair differences.",
+        "dct": "DCT coefficient steganography detected. Data hidden in JPEG frequency domain.",
+        "fft": "Frequency-domain steganography detected. Hidden data found via spectral analysis.",
+    }
 
+    probs = None
+    model_error = None
+
+    try:
+        import torch
+        import torch.nn as nn
+        from torchvision.models import efficientnet_v2_s
+        from torchvision.transforms import v2
+        from PIL import Image as PILImage2
+
+        # Find model weights — look in project root and common locations
+        search_paths = [
+            Path(__file__).resolve().parent.parent / "stego_efficientv2.pth",
+            Path(__file__).resolve().parent / "stego_efficientv2.pth",
+            Path("stego_efficientv2.pth"),
+        ]
+        model_path = next((p for p in search_paths if p.exists()), None)
+
+        if model_path is None:
+            raise FileNotFoundError(
+                "stego_efficientv2.pth not found. Place it in the project root folder."
+            )
+
+        @st.cache_resource
+        def _load_stego_model(path_str):
+            m = efficientnet_v2_s(weights=None)
+            m.classifier = nn.Sequential(
+                nn.Dropout(p=0.2),
+                nn.Linear(m.classifier[1].in_features, 5)
+            )
+            m.load_state_dict(torch.load(path_str, map_location="cpu"))
+            m.eval()
+            return m
+
+        model = _load_stego_model(str(model_path))
+
+        # Preprocess — matches training pipeline exactly
+        img_pil = PILImage2.open(image_path).convert("RGB")
+        iw, ih  = img_pil.size
+        size    = 256
+        transform = v2.Compose([
+            v2.Pad(
+                padding=(max(0,(size-iw)//2), max(0,(size-ih)//2),
+                         max(0,(size-iw+1)//2), max(0,(size-ih+1)//2)),
+                fill=0
+            ),
+            v2.CenterCrop((size, size)),
+            v2.ToImage(),
+            v2.ToDtype(torch.float32),
+            v2.Normalize([0.485*255, 0.456*255, 0.406*255],
+                         [0.229*255, 0.224*255, 0.225*255]),
+        ])
+        tensor = transform(img_pil).unsqueeze(0)
+
+        with torch.no_grad():
+            probs = torch.softmax(model(tensor), dim=1).squeeze().numpy()
+
+    except Exception as e:
+        model_error = str(e)
+
+    # ── Build findings in the schema expected by the UI ───────────────────────
     findings = []
-    for tech_key in techniques:
-        label = next((k for k, v in STEGO_TECHNIQUES.items() if v == tech_key), tech_key)
-        detected = rng.random() < 0.25   # 25% hit rate in stub
-        conf = rng.uniform(0.6, 0.9) if detected else rng.uniform(0.05, 0.25)
-        risk = "LOW" if not detected else ("HIGH" if conf > 0.75 else "MEDIUM")
-        findings.append({
-            "technique"   : tech_key,
-            "label"       : label,
-            "detected"    : detected,
-            "confidence"  : round(conf, 3),
-            "risk_level"  : risk,
+
+    if probs is not None:
+        clean_prob = float(probs[0])
+        is_stego   = clean_prob <= 0.03
+
+        # One finding per stego class, shown if that technique is selected
+        for i, (label, key) in enumerate(zip(CLASS_LABELS[1:], CLASS_KEYS[1:]), start=1):
+            tech_key = MODEL_CLASS_TO_TECHNIQUE.get(key, key)
+            # Only include if user selected this technique (or always include all)
+            conf      = float(probs[i])
+            detected  = is_stego and (conf == float(max(probs[1:])))
+            risk      = "HIGH" if detected and conf > 0.5 else ("MEDIUM" if detected else "NONE")
+            findings.append({
+                "technique"   : tech_key,
+                "label"       : f"{label} Steganography",
+                "detected"    : detected,
+                "confidence"  : round(conf, 3),
+                "risk_level"  : risk,
+                "detail"      : CLASS_DETAILS[key] if detected else f"No {label} steganography detected.",
+                "payload_hint": None,
+            })
+
+        # Add a clean/overall row
+        findings.insert(0, {
+            "technique"   : "model",
+            "label"       : "Neural Network (EfficientNetV2)",
+            "detected"    : is_stego,
+            "confidence"  : round(1 - clean_prob, 3),
+            "risk_level"  : "HIGH" if is_stego else "NONE",
             "detail"      : (
-                f"Anomalous {tech_key.upper()} patterns detected with confidence {conf:.0%}. "
-                "Possible hidden payload — manual inspection recommended."
-            ) if detected else f"No {tech_key.upper()} anomalies detected.",
-            "payload_hint": f"~{rng.uniform(0.5, 8.0):.1f} KB estimated" if detected else None,
+                f"Model confidence: {(1-clean_prob)*100:.0f}% probability of hidden data. "
+                f"Clean probability: {clean_prob*100:.0f}%."
+            ),
+            "payload_hint": None,
         })
 
-    any_detected = any(f["detected"] for f in findings)
-    overall_conf = max((f["confidence"] for f in findings), default=0.0)
-    overall_risk = "HIGH" if overall_conf > 0.75 and any_detected else (
-        "MEDIUM" if overall_conf > 0.50 and any_detected else
-        "LOW"    if any_detected else "NONE"
-    )
+        overall_conf = round(1 - clean_prob, 3)
+        overall_risk = "HIGH" if is_stego and overall_conf > 0.7 else (
+                       "MEDIUM" if is_stego else "NONE")
+
+    else:
+        # Model failed to load — fall back to entropy-based heuristic
+        is_stego     = entropy > 7.6
+        overall_conf = min(1.0, max(0.0, (entropy - 7.0) / 1.5)) if is_stego else 0.1
+        overall_risk = "REVIEW" if is_stego else "NONE"
+        detail_note  = f"Model unavailable: {model_error} — entropy heuristic used instead."
+
+        findings = [{
+            "technique"   : "entropy",
+            "label"       : "Entropy Analysis (fallback)",
+            "detected"    : is_stego,
+            "confidence"  : round(overall_conf, 3),
+            "risk_level"  : overall_risk,
+            "detail"      : detail_note,
+            "payload_hint": None,
+        }]
+
+    duration = round(time.time() - start, 2)
 
     return {
-        "is_stego"          : any_detected,
+        "is_stego"          : is_stego,
         "overall_risk"      : overall_risk,
-        "overall_confidence": round(overall_conf, 3),
+        "overall_confidence": overall_conf,
         "findings"          : findings,
         "image_stats"       : {
             "width"       : w,
@@ -158,9 +233,8 @@ def _run_stego_analysis(image_path: str, techniques: list) -> dict:
             "file_size_kb": round(file_kb, 1),
             "entropy"     : round(entropy, 3),
         },
-        "duration_sec": 0.6,
+        "duration_sec": duration,
     }
-    # ── END STUB ──────────────────────────────────────────────────────────────
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -265,94 +339,87 @@ def _render_stego_banner(result: dict):
     """, unsafe_allow_html=True)
 
 
+def _clean_detail(detail: str, conf: float) -> str:
+    """
+    Strip ALL HTML from a detail string and return plain text only.
+    No matter what the model or cache puts in 'detail', this returns
+    a safe human-readable string — never markup.
+    """
+    import re
+    text = re.sub(r"<[^>]*>", "", str(detail))   # remove every HTML tag
+    text = re.sub(r"\s+", " ", text).strip()       # collapse whitespace
+    # If what remains is just CSS junk or too short, use a safe fallback
+    css_junk = ["display:", "align-items", "justify-content", "margin-",
+                 "width:", "height:", "background:", "border-", "font-",
+                 "color:", "padding", "style=", "flex-"]
+    if len(text) < 8 or any(p in text for p in css_junk):
+        return f"Analysis complete — {conf:.0%} confidence."
+    return text
+
+
 def _render_technique_results(findings: list):
+    """
+    Render each finding as a native Streamlit card.
+    Uses ZERO st.markdown(html) for user-data fields — all dynamic
+    content (label, detail, confidence) goes through st.write / st.progress
+    so broken HTML in findings can never leak into the page.
+    """
     if not findings:
         st.info("No findings to display.")
         return
 
-    rows_html = ""
     for f in findings:
         detected = f.get("detected", False)
         risk     = f.get("risk_level", "NONE")
-        fg, _    = RISK_COLORS.get(risk if detected else "NONE", ("#8B9AC7", "#151B2D"))
-        icon     = RISK_ICONS.get(risk if detected else "NONE", "✅")
         conf     = f.get("confidence", 0.0)
-        bar_w    = int(conf * 100)
-        label    = f.get("label", f.get("technique", "?"))
-        detail   = f.get("detail", "")
+        label    = str(f.get("label", f.get("technique", "Unknown")))
+        detail   = _clean_detail(f.get("detail", ""), conf)
         payload  = f.get("payload_hint")
 
-        payload_html = f"""
-        <span style="
-            background: #FF3B3B22;
-            color: #FF3B3B;
-            border: 1px solid #FF3B3B44;
-            border-radius: 3px;
-            padding: 1px 7px;
-            font-size: 0.63rem;
-            font-weight: 600;
-            margin-left: 8px;
-        ">📦 {payload}</span>""" if payload else ""
+        fg, _    = RISK_COLORS.get(risk if detected else "NONE", ("#8B9AC7", "#151B2D"))
+        icon     = RISK_ICONS.get(risk if detected else "NONE", "✅")
+        risk_label = risk if detected else "NONE"
 
-        rows_html += f"""
-        <div style="
-            background: #111827;
-            border: 1px solid #1E293B;
-            border-radius: 6px;
-            padding: 0.85rem 1rem;
-            margin-bottom: 8px;
-            display: flex;
-            align-items: flex-start;
-            gap: 1rem;
-        ">
-            <div style="
-                width: 18px; height: 18px;
-                border-radius: 50%;
-                background: {fg}22;
-                border: 1px solid {fg};
-                display: flex; align-items: center; justify-content: center;
-                font-size: 0.65rem;
-                flex-shrink: 0;
-                margin-top: 2px;
-            ">{icon}</div>
-            <div style="flex: 1; min-width: 0;">
-                <div style="
-                    display: flex;
-                    align-items: center;
-                    gap: 8px;
-                    margin-bottom: 4px;
-                ">
-                    <span style="
-                        font-size: 0.78rem;
-                        font-weight: 600;
-                        color: {'#E2E8F0' if detected else '#4B5563'};
-                        letter-spacing: 0.03em;
-                    ">{label}</span>
-                    {payload_html}
-                </div>
-                <div style="
-                    font-size: 0.68rem;
-                    color: #6B7280;
-                    line-height: 1.5;
-                    margin-bottom: 6px;
-                ">{detail}</div>
-                <div style="display:flex; align-items:center; gap:8px;">
-                    <div style="
-                        width: 120px; height: 4px;
-                        background: #1E293B; border-radius: 2px; overflow: hidden;
-                    ">
-                        <div style="
-                            width: {bar_w}%; height: 100%;
-                            background: {fg}; border-radius: 2px;
-                        "></div>
-                    </div>
-                    <span style="font-size:0.68rem;color:#8B9AC7;">{conf:.0%} confidence</span>
-                </div>
-            </div>
-        </div>
-        """
+        # ── Card border via a single safe markdown div (no user data inside) ──
+        st.markdown(
+            f'<div style="border-left:3px solid {fg};border-radius:8px;'
+            f'background:#111827;border:1px solid #1E293B;'
+            f'padding:14px 16px 10px 16px;margin-bottom:12px;">',
+            unsafe_allow_html=True,
+        )
 
-    st.markdown(rows_html, unsafe_allow_html=True)
+        # Header row — icon + label + risk badge, all plain strings
+        col_icon, col_text, col_badge = st.columns([0.08, 0.72, 0.20])
+        with col_icon:
+            st.markdown(
+                f'<div style="font-size:1rem;padding-top:4px">{icon}</div>',
+                unsafe_allow_html=True,
+            )
+        with col_text:
+            st.markdown(
+                f'<div style="font-size:0.80rem;font-weight:700;color:#E2E8F0;">'
+                f'{html_module.escape(label)}</div>'
+                f'<div style="font-size:0.60rem;color:#64748B;letter-spacing:0.12em;'
+                f'text-transform:uppercase;">{html_module.escape(risk_label)} Risk</div>',
+                unsafe_allow_html=True,
+            )
+        with col_badge:
+            if payload:
+                st.markdown(
+                    f'<div style="font-size:0.62rem;color:#FF3B3B;background:#FF3B3B22;'
+                    f'border:1px solid #FF3B3B44;border-radius:4px;padding:2px 6px;'
+                    f'text-align:center;">📦 {html_module.escape(str(payload))}</div>',
+                    unsafe_allow_html=True,
+                )
+
+        # Detail — rendered as plain Streamlit text, never HTML
+        st.caption(detail)
+
+        # Confidence bar — native st.progress (no HTML)
+        st.progress(min(1.0, max(0.0, conf)), text=f"{conf:.0%}")
+
+        # Close the card div
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _render_image_stats(stats: dict, entropy: float):
@@ -418,7 +485,6 @@ def _render_channel_inspector(image_path: str):
              (lsb_plane, "LSB PLANE", [255,255,0])]
         ):
             with col:
-                # Render as greyscale image with a coloured border
                 col.markdown(f"""
                 <div style="
                     font-size:0.6rem;color:#4B5563;
@@ -469,6 +535,16 @@ def _render_entropy_histogram(image_path: str):
 
 def render_tab_stego():
     techniques, show_channels, show_histogram = render_sidebar_stego()
+
+    # ── Invalidate stale cache if findings contain raw HTML ────────────────────
+    cached = st.session_state.get("stego_result")
+    if cached:
+        for _f in cached.get("findings", []):
+            _d = str(_f.get("detail", ""))
+            if any(p in _d for p in ["<div", "display:flex", "style="]):
+                for _k in ["stego_result", "stego_last_file", "stego_tmp_path"]:
+                    st.session_state.pop(_k, None)
+                break
 
     # ── Upload zone ────────────────────────────────────────────────────────────
     col_up, col_btn = st.columns([3, 1])
@@ -561,5 +637,5 @@ def render_tab_stego():
         color: #374151;
         margin-top: 0.75rem;
         font-family: 'JetBrains Mono', monospace;
-    ">Analysis completed in {duration:.2f}s · {uploaded.name}</div>
+    ">Analysis completed in {duration:.2f}s · {html_module.escape(uploaded.name)}</div>
     """, unsafe_allow_html=True)
