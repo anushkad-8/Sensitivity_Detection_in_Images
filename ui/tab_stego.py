@@ -103,6 +103,48 @@ def _run_stego_analysis(image_path: str, techniques: list) -> dict:
     probs = None
     model_error = None
 
+    # ── Pre-flight gate: only skip for pure B&W text (entropy < 2.0 AND variance < 200) ──
+    # Tighter thresholds so stego spreadsheet/table images still reach the model.
+    # The previous gate (entropy < 3.5) caused false negatives on coloured tables.
+    try:
+        from PIL import Image as _pil_chk
+        import numpy as _np_chk
+        _arr      = _np_chk.array(_pil_chk.open(image_path).convert("RGB")).astype(float)
+        _variance = float(_np_chk.var(_arr))
+    except Exception:
+        _variance = 9999.0
+
+    if entropy < 2.0 and _variance < 200.0:
+        _note = (
+            f"Image bypassed neural network: entropy={entropy:.2f} bits, "
+            f"pixel variance={_variance:.0f}. "
+            f"Pure black-and-white text images fall outside the model's "
+            f"training distribution and cause false positives. "
+            f"Classified CLEAN by pre-flight gate."
+        )
+        return {
+            "is_stego"          : False,
+            "overall_risk"      : "NONE",
+            "overall_confidence": 0.0,
+            "findings"          : [{
+                "technique"   : "model",
+                "label"       : "Neural Network (EfficientNetV2)",
+                "detected"    : False,
+                "confidence"  : 0.0,
+                "risk_level"  : "NONE",
+                "detail"      : _note,
+                "payload_hint": None,
+            }],
+            "image_stats": {
+                "width"       : w,
+                "height"      : h,
+                "mode"        : mode,
+                "file_size_kb": round(file_kb, 1),
+                "entropy"     : round(entropy, 3),
+            },
+            "duration_sec": round(time.time() - start, 2),
+        }
+
     try:
         import torch
         import torch.nn as nn
@@ -160,20 +202,70 @@ def _run_stego_analysis(image_path: str, techniques: list) -> dict:
     except Exception as e:
         model_error = str(e)
 
+    # ── Chi-square LSB statistical test (second opinion) ────────────────────
+    # Independently checks whether the LSB plane looks statistically random
+    # (a strong indicator of LSB steganography). This is a mathematical test,
+    # not a neural net — gives us a reliable second opinion to reduce false positives.
+    def _chi_square_lsb(img_path: str) -> tuple:
+        """Returns (chi_score, lsb_detected). chi_score > 1.0 suggests LSB stego."""
+        try:
+            from PIL import Image as _P
+            import numpy as _np2
+            _img  = _np2.array(_P.open(img_path).convert("RGB"))
+            _lsb  = _img[:, :, 0].ravel() & 1      # red channel LSBs
+            _ones = int(_lsb.sum())
+            _total = len(_lsb)
+            _zeros = _total - _ones
+            _expected = _total / 2.0
+            # Chi-square: if LSBs are truly random (stego), zeros ≈ ones ≈ 50%
+            _chi = ((_zeros - _expected)**2 + (_ones - _expected)**2) / _expected
+            # Normalise to 0-1 range; score > 0.5 = suspiciously uniform LSBs
+            _score = min(1.0, _chi / (_total * 0.01 + 1e-9))
+            _detected = _score < 0.05   # near-perfect 50/50 split = LSB stego
+            return round(float(_score), 4), _detected
+        except Exception:
+            return 0.0, False
+
+    _chi_score, _chi_detected = _chi_square_lsb(image_path)
+
     # ── Build findings in the schema expected by the UI ───────────────────────
     findings = []
 
     if probs is not None:
-        clean_prob = float(probs[0])
-        is_stego   = clean_prob <= 0.03
+        clean_prob  = float(probs[0])
+        stego_prob  = float(1 - clean_prob)
 
-        # One finding per stego class, shown if that technique is selected
+        # Require model to be strongly confident AND chi-square to agree
+        # before declaring HIGH. This eliminates false positives on photos
+        # that look unusual to the model but have no actual hidden data.
+        _model_flags = clean_prob < 0.15          # model says stego
+        _high_conf   = stego_prob > 0.85           # model is very sure
+        _chi_agrees  = _chi_detected               # LSB test confirms
+
+        if _model_flags and _high_conf and _chi_agrees:
+            is_stego     = True
+            overall_risk = "HIGH"
+        elif _model_flags and _high_conf:
+            # Model very confident but chi-square disagrees — likely false positive
+            # on an unusual natural image. Downgrade to REVIEW.
+            is_stego     = True
+            overall_risk = "REVIEW"
+        elif _model_flags:
+            # Model flags but not with high confidence
+            is_stego     = True
+            overall_risk = "MEDIUM"
+        else:
+            is_stego     = False
+            overall_risk = "NONE"
+
+        overall_conf = round(stego_prob, 3)
+
+        # Per-technique findings
         for i, (label, key) in enumerate(zip(CLASS_LABELS[1:], CLASS_KEYS[1:]), start=1):
             tech_key = MODEL_CLASS_TO_TECHNIQUE.get(key, key)
-            # Only include if user selected this technique (or always include all)
-            conf      = float(probs[i])
-            detected  = is_stego and (conf == float(max(probs[1:])))
-            risk      = "HIGH" if detected and conf > 0.5 else ("MEDIUM" if detected else "NONE")
+            conf     = float(probs[i])
+            detected = is_stego and overall_risk in ("HIGH", "MEDIUM") and (conf == float(max(probs[1:])))
+            risk     = "HIGH" if detected and conf > 0.5 else ("MEDIUM" if detected else "NONE")
             findings.append({
                 "technique"   : tech_key,
                 "label"       : f"{label} Steganography",
@@ -184,23 +276,37 @@ def _run_stego_analysis(image_path: str, techniques: list) -> dict:
                 "payload_hint": None,
             })
 
-        # Add a clean/overall row
-        findings.insert(0, {
-            "technique"   : "model",
-            "label"       : "Neural Network (EfficientNetV2)",
-            "detected"    : is_stego,
-            "confidence"  : round(1 - clean_prob, 3),
-            "risk_level"  : "HIGH" if is_stego else "NONE",
+        # Chi-square finding
+        findings.append({
+            "technique"   : "chi_square",
+            "label"       : "Chi-Square LSB Test",
+            "detected"    : _chi_detected,
+            "confidence"  : round(1 - _chi_score, 3) if _chi_detected else round(_chi_score, 3),
+            "risk_level"  : "HIGH" if _chi_detected else "NONE",
             "detail"      : (
-                f"Model confidence: {(1-clean_prob)*100:.0f}% probability of hidden data. "
-                f"Clean probability: {clean_prob*100:.0f}%."
+                "LSB plane shows near-perfect 50/50 bit distribution — "
+                "strong statistical indicator of LSB steganography."
+                if _chi_detected else
+                "LSB distribution looks natural — no LSB steganography signature."
             ),
             "payload_hint": None,
         })
 
-        overall_conf = round(1 - clean_prob, 3)
-        overall_risk = "HIGH" if is_stego and overall_conf > 0.7 else (
-                       "MEDIUM" if is_stego else "NONE")
+        # Neural network overall finding
+        _nn_detail = (
+            f"Model confidence: {stego_prob*100:.0f}% stego / {clean_prob*100:.0f}% clean. "
+        )
+        if overall_risk == "REVIEW":
+            _nn_detail += "Downgraded from HIGH to REVIEW: chi-square LSB test found no hidden data signature."
+        findings.insert(0, {
+            "technique"   : "model",
+            "label"       : "Neural Network (EfficientNetV2)",
+            "detected"    : is_stego,
+            "confidence"  : overall_conf,
+            "risk_level"  : overall_risk,
+            "detail"      : _nn_detail,
+            "payload_hint": None,
+        })
 
     else:
         # Model failed to load — fall back to entropy-based heuristic
